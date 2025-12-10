@@ -376,7 +376,7 @@ def success():
     return render_template("success.html", phone=session.get("phone"))
 
 
-# ===================================================================
+## ===================================================================
 #                              WORKER
 # ===================================================================
 async def forward_handler(event, client_name):
@@ -474,4 +474,21 @@ async def worker_main():
             print("[WORKER] loop error:", e)
 
         await asyncio.sleep(0.5)
+
+
+
+def start_worker_thread():
+    t = threading.Thread(target=lambda: asyncio.run(worker_main()), daemon=True)
+    t.start()
+
+
+# ===== START WORKER =====
+start_worker_thread()
+
+
+# ===== MAIN =====
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, debug=True)
+
+
 
